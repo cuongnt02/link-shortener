@@ -6,16 +6,24 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"strings"
 	"testing"
 
 	"github.com/cuongnt02/link-shortener/internal/handler"
+	"github.com/cuongnt02/link-shortener/internal/link"
+	"github.com/cuongnt02/link-shortener/internal/shortener"
 	"github.com/cuongnt02/link-shortener/internal/store"
 )
 
 // Integration tests: a real HTTP server (httptest.NewServer) runs the full
 // router from h.Routes(), and a real HTTP client sends requests over the
-// network. This checks the routing, the handlers and the store together.
+// network. Nothing is faked: the real handler, service, code generator
+// and memory store all work together, wired the same way main.go does it.
+
+// codePattern is what every generated code must look like:
+// exactly 6 characters from the base62 alphabet.
+var codePattern = regexp.MustCompile(`^[A-Za-z0-9]{6}$`)
 
 // newTestServer starts a server running the app's routes. The handler's
 // base URL must be the server's own URL so that short_url values can be
@@ -27,7 +35,9 @@ func newTestServer(t *testing.T) *httptest.Server {
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 
-	h := handler.New(store.NewInMemoryStore(), srv.URL)
+	generate := func() (string, error) { return shortener.GenCode(6) }
+	svc := link.NewService(store.NewInMemoryStore(), generate)
+	h := handler.New(svc, srv.URL)
 	mux.Handle("/", h.Routes())
 	return srv
 }
@@ -95,6 +105,13 @@ func TestShortenThenRedirect(t *testing.T) {
 
 	resp := shortenOverHTTP(t, srv, target)
 
+	if !codePattern.MatchString(resp.Code) {
+		t.Errorf("code = %q, want 6 base62 characters", resp.Code)
+	}
+	if want := srv.URL + "/" + resp.Code; resp.ShortURL != want {
+		t.Errorf("short_url = %q, want %q", resp.ShortURL, want)
+	}
+
 	res, err := noRedirectClient().Get(resp.ShortURL)
 	if err != nil {
 		t.Fatalf("GET %s: %v", resp.ShortURL, err)
@@ -139,6 +156,34 @@ func TestFollowShortLinkEndToEnd(t *testing.T) {
 	}
 	if string(body) != "welcome to the destination" {
 		t.Errorf("final body = %q, want the destination page", body)
+	}
+}
+
+// TestShortenRejectsBadInputEndToEnd checks that bad input becomes a 400
+// through the real chain: the handler rejects bad JSON itself, and the
+// real service rejects bad URLs. The unit tests check each part alone;
+// this checks they are connected correctly.
+func TestShortenRejectsBadInputEndToEnd(t *testing.T) {
+	srv := newTestServer(t)
+	bodies := []string{
+		`not json`,
+		`{}`,
+		`{"url":"go.dev"}`,
+		`{"url":"ftp://go.dev/file"}`,
+		`{"url":"https://"}`,
+	}
+	for _, body := range bodies {
+		t.Run(body, func(t *testing.T) {
+			res, err := http.Post(srv.URL+"/shorten", "application/json", strings.NewReader(body))
+			if err != nil {
+				t.Fatalf("POST /shorten: %v", err)
+			}
+			res.Body.Close()
+
+			if res.StatusCode != http.StatusBadRequest {
+				t.Errorf("body %q: status = %d, want %d", body, res.StatusCode, http.StatusBadRequest)
+			}
+		})
 	}
 }
 

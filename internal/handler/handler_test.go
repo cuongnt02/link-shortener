@@ -1,26 +1,30 @@
 package handler_test
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"regexp"
 	"strings"
 	"testing"
 
 	"github.com/cuongnt02/link-shortener/internal/handler"
-	"github.com/cuongnt02/link-shortener/internal/store"
+	"github.com/cuongnt02/link-shortener/internal/link"
 )
 
 // Unit tests: each test calls one handler method directly with a fake
 // request (httptest.NewRequest) and records the response
-// (httptest.NewRecorder). No router and no network are involved.
+// (httptest.NewRecorder). The handler's link service is replaced by a
+// fake, so these tests only check the handler's own job: turning HTTP
+// into service calls, and service results into HTTP responses.
+
+// The real service must satisfy the handler's interface. If the method
+// signatures drift apart, this package fails to compile.
+var _ handler.LinkService = (*link.Service)(nil)
 
 const testBaseURL = "http://short.test"
-
-// codePattern is what every generated code must look like:
-// exactly 6 characters from the base62 alphabet.
-var codePattern = regexp.MustCompile(`^[A-Za-z0-9]{6}$`)
 
 // shortenResponse mirrors the JSON body that POST /shorten returns.
 type shortenResponse struct {
@@ -28,12 +32,34 @@ type shortenResponse struct {
 	ShortURL string `json:"short_url"`
 }
 
-// newTestHandler returns a handler backed by a fresh, empty store.
-// The store is returned too, so tests can check what was saved.
-func newTestHandler(t *testing.T) (*handler.Handler, *store.MemoryStore) {
-	t.Helper()
-	s := store.NewInMemoryStore()
-	return handler.New(s, testBaseURL), s
+// errInternal stands in for an unexpected failure. Its message contains
+// details that must never be shown to clients.
+var errInternal = errors.New("db password=hunter2 connection refused")
+
+// fakeService is a handler.LinkService that returns preset results and
+// records what the handler passed in.
+type fakeService struct {
+	shortenCode string
+	shortenErr  error
+	resolveURL  string
+	resolveErr  error
+
+	shortenCalls int
+	gotURL       string
+	resolveCalls int
+	gotCode      string
+}
+
+func (f *fakeService) Shorten(_ context.Context, rawURL string) (string, error) {
+	f.shortenCalls++
+	f.gotURL = rawURL
+	return f.shortenCode, f.shortenErr
+}
+
+func (f *fakeService) Resolve(_ context.Context, code string) (string, error) {
+	f.resolveCalls++
+	f.gotCode = code
+	return f.resolveURL, f.resolveErr
 }
 
 // callShorten sends body to the Shorten handler and returns the recorded response.
@@ -57,24 +83,16 @@ func callRedirect(t *testing.T, h *handler.Handler, code string) *httptest.Respo
 	return rec
 }
 
-// decodeShorten checks for a 201 JSON response and decodes its body.
-func decodeShorten(t *testing.T, rec *httptest.ResponseRecorder) shortenResponse {
+// assertNoLeak checks that an error response doesn't expose internal details.
+func assertNoLeak(t *testing.T, rec *httptest.ResponseRecorder) {
 	t.Helper()
-	if rec.Code != http.StatusCreated {
-		t.Fatalf("status = %d, want %d; body: %q", rec.Code, http.StatusCreated, rec.Body.String())
+	if body := rec.Body.String(); strings.Contains(body, "hunter2") {
+		t.Errorf("response body leaks internal error details: %q", body)
 	}
-	if ct := rec.Header().Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
-		t.Errorf("Content-Type = %q, want prefix %q", ct, "application/json")
-	}
-	var resp shortenResponse
-	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
-		t.Fatalf("response body is not valid JSON: %v", err)
-	}
-	return resp
 }
 
 func TestHealth(t *testing.T) {
-	h, _ := newTestHandler(t)
+	h := handler.New(&fakeService{}, testBaseURL)
 	req := httptest.NewRequest(http.MethodGet, "/health", nil)
 	rec := httptest.NewRecorder()
 
@@ -88,76 +106,38 @@ func TestHealth(t *testing.T) {
 	}
 }
 
-// TestShortenValidURL checks the full success response, and that the link
-// was really saved in the store.
-func TestShortenValidURL(t *testing.T) {
-	h, s := newTestHandler(t)
+// TestShortenSuccess checks the handler passes the url to the service and
+// builds the 201 JSON response from the code the service returns.
+func TestShortenSuccess(t *testing.T) {
+	svc := &fakeService{shortenCode: "abc123"}
+	h := handler.New(svc, testBaseURL)
 
-	resp := decodeShorten(t, callShorten(t, h, `{"url":"https://go.dev"}`))
+	rec := callShorten(t, h, `{"url":"https://go.dev"}`)
 
-	if !codePattern.MatchString(resp.Code) {
-		t.Errorf("code = %q, want 6 base62 characters", resp.Code)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want %d; body: %q", rec.Code, http.StatusCreated, rec.Body.String())
 	}
-	if want := testBaseURL + "/" + resp.Code; resp.ShortURL != want {
+	if ct := rec.Header().Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
+		t.Errorf("Content-Type = %q, want prefix %q", ct, "application/json")
+	}
+	if svc.gotURL != "https://go.dev" {
+		t.Errorf("service received url %q, want %q", svc.gotURL, "https://go.dev")
+	}
+	var resp shortenResponse
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("response body is not valid JSON: %v", err)
+	}
+	if resp.Code != "abc123" {
+		t.Errorf("code = %q, want %q", resp.Code, "abc123")
+	}
+	if want := testBaseURL + "/abc123"; resp.ShortURL != want {
 		t.Errorf("short_url = %q, want %q", resp.ShortURL, want)
 	}
-	got, err := s.Get(resp.Code)
-	if err != nil {
-		t.Fatalf("store.Get(%q) after shorten returned error: %v", resp.Code, err)
-	}
-	if want := "https://go.dev"; got != want {
-		t.Errorf("store.Get(%q) = %q, want %q", resp.Code, got, want)
-	}
 }
 
-// TestShortenAcceptsURLVariants checks that real-world URLs with ports,
-// paths, query strings and fragments are accepted unchanged.
-func TestShortenAcceptsURLVariants(t *testing.T) {
-	urls := []string{
-		"http://example.com",
-		"https://example.com/a/long/path",
-		"https://example.com:8443/path",
-		"https://example.com/search?q=golang&page=2",
-		"https://example.com/page#section",
-	}
-	for _, u := range urls {
-		t.Run(u, func(t *testing.T) {
-			h, s := newTestHandler(t)
-			body, err := json.Marshal(map[string]string{"url": u})
-			if err != nil {
-				t.Fatalf("setup: marshal request: %v", err)
-			}
-
-			resp := decodeShorten(t, callShorten(t, h, string(body)))
-
-			got, err := s.Get(resp.Code)
-			if err != nil {
-				t.Fatalf("store.Get(%q) returned error: %v", resp.Code, err)
-			}
-			if got != u {
-				t.Errorf("stored url = %q, want %q", got, u)
-			}
-		})
-	}
-}
-
-// TestShortenSameURLTwice checks that every request creates a new link,
-// even for a URL that was shortened before.
-func TestShortenSameURLTwice(t *testing.T) {
-	h, _ := newTestHandler(t)
-	body := `{"url":"https://go.dev"}`
-
-	first := decodeShorten(t, callShorten(t, h, body))
-	second := decodeShorten(t, callShorten(t, h, body))
-
-	if first.Code == second.Code {
-		t.Errorf("both requests returned code %q, want two different codes", first.Code)
-	}
-}
-
-// TestShortenRejectsBadInput checks that every invalid request gets
-// 400 Bad Request.
-func TestShortenRejectsBadInput(t *testing.T) {
+// TestShortenBadJSON checks that a body the handler can't decode is
+// rejected with 400 before the service is ever called.
+func TestShortenBadJSON(t *testing.T) {
 	tests := []struct {
 		name string
 		body string
@@ -165,36 +145,62 @@ func TestShortenRejectsBadInput(t *testing.T) {
 		{"empty body", ``},
 		{"not json", `hello`},
 		{"malformed json", `{"url":`},
-		{"url field missing", `{}`},
-		{"url is empty", `{"url":""}`},
 		{"url is not a string", `{"url":123}`},
-		{"relative path", `{"url":"/just/a/path"}`},
-		{"no scheme", `{"url":"go.dev"}`},
-		{"ftp scheme", `{"url":"ftp://go.dev/file"}`},
-		{"javascript scheme", `{"url":"javascript:alert(1)"}`},
-		{"scheme without host", `{"url":"https://"}`},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			h, _ := newTestHandler(t)
+			svc := &fakeService{shortenCode: "abc123"}
+			h := handler.New(svc, testBaseURL)
 
 			rec := callShorten(t, h, tt.body)
 
 			if rec.Code != http.StatusBadRequest {
 				t.Errorf("body %q: status = %d, want %d", tt.body, rec.Code, http.StatusBadRequest)
 			}
+			if svc.shortenCalls != 0 {
+				t.Errorf("service called %d times, want 0 for undecodable JSON", svc.shortenCalls)
+			}
+		})
+	}
+}
+
+// TestShortenServiceErrors checks how each kind of service error maps to
+// an HTTP status. Errors are wrapped the way a real service would wrap
+// them, so the handler must use errors.Is, not ==.
+func TestShortenServiceErrors(t *testing.T) {
+	tests := []struct {
+		name       string
+		err        error
+		wantStatus int
+	}{
+		{"invalid url", link.ErrInvalidURL, http.StatusBadRequest},
+		{"wrapped invalid url", fmt.Errorf("%w: scheme %q not allowed", link.ErrInvalidURL, "ftp"), http.StatusBadRequest},
+		{"unexpected error", errInternal, http.StatusInternalServerError},
+		{"wrapped unexpected error", fmt.Errorf("saving link: %w", errInternal), http.StatusInternalServerError},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := handler.New(&fakeService{shortenErr: tt.err}, testBaseURL)
+
+			rec := callShorten(t, h, `{"url":"https://go.dev"}`)
+
+			if rec.Code != tt.wantStatus {
+				t.Errorf("status = %d, want %d", rec.Code, tt.wantStatus)
+			}
+			assertNoLeak(t, rec)
 		})
 	}
 }
 
 func TestRedirectKnownCode(t *testing.T) {
-	h, s := newTestHandler(t)
-	if err := s.Save("abc123", "https://go.dev/doc"); err != nil {
-		t.Fatalf("setup: Save returned error: %v", err)
-	}
+	svc := &fakeService{resolveURL: "https://go.dev/doc"}
+	h := handler.New(svc, testBaseURL)
 
 	rec := callRedirect(t, h, "abc123")
 
+	if svc.gotCode != "abc123" {
+		t.Errorf("service received code %q, want %q", svc.gotCode, "abc123")
+	}
 	if rec.Code != http.StatusFound {
 		t.Errorf("status = %d, want %d", rec.Code, http.StatusFound)
 	}
@@ -203,15 +209,32 @@ func TestRedirectKnownCode(t *testing.T) {
 	}
 }
 
-func TestRedirectUnknownCode(t *testing.T) {
-	h, _ := newTestHandler(t)
-
-	rec := callRedirect(t, h, "nope42")
-
-	if rec.Code != http.StatusNotFound {
-		t.Errorf("status = %d, want %d", rec.Code, http.StatusNotFound)
+// TestRedirectServiceErrors checks the status for each kind of service
+// error, and that no redirect is sent when resolving failed.
+func TestRedirectServiceErrors(t *testing.T) {
+	tests := []struct {
+		name       string
+		err        error
+		wantStatus int
+	}{
+		{"not found", link.ErrNotFound, http.StatusNotFound},
+		{"wrapped not found", fmt.Errorf("resolve %q: %w", "nope42", link.ErrNotFound), http.StatusNotFound},
+		{"unexpected error", errInternal, http.StatusInternalServerError},
+		{"wrapped unexpected error", fmt.Errorf("loading link: %w", errInternal), http.StatusInternalServerError},
 	}
-	if loc := rec.Header().Get("Location"); loc != "" {
-		t.Errorf("Location = %q, want no Location header", loc)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := handler.New(&fakeService{resolveErr: tt.err}, testBaseURL)
+
+			rec := callRedirect(t, h, "nope42")
+
+			if rec.Code != tt.wantStatus {
+				t.Errorf("status = %d, want %d", rec.Code, tt.wantStatus)
+			}
+			if loc := rec.Header().Get("Location"); loc != "" {
+				t.Errorf("Location = %q, want no Location header", loc)
+			}
+			assertNoLeak(t, rec)
+		})
 	}
 }

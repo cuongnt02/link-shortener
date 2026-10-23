@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"errors"
 	"sync"
 )
@@ -14,7 +15,7 @@ var (
 
 // MemoryStore is an in memory data structure to store all code to links data
 // MemoryStore have many operations that can modify the map of code to links
-// The store is safe from concurrent use
+// The store is safe from concurrent use by multiple goroutines
 type MemoryStore struct {
 	mu         sync.RWMutex // protects codeToLink from concurrent access
 	codeToLink map[string]string
@@ -28,10 +29,11 @@ func NewInMemoryStore() *MemoryStore {
 	}
 }
 
-// Save add a new code and url mapping into the MemoryStore's map
-func (s *MemoryStore) Save(code, url string) error {
-	s.mutex.Lock()
-	defer s.mutex.Unlock()
+// Save add a new code and url mapping into the MemoryStore's map.
+// ErrCodeExists is returned when the code used to save is duplicated with an entry
+func (s *MemoryStore) Save(_ context.Context, code, url string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if _, ok := s.codeToLink[code]; ok {
 		return ErrCodeExists
 	}
@@ -39,10 +41,11 @@ func (s *MemoryStore) Save(code, url string) error {
 	return nil
 }
 
-// Get returns the mapped url as the code provided. Returns a blank string and an error when the code provided not exists in the map
-func (s *MemoryStore) Get(code string) (string, error) {
-	s.mutex.RLock()
-	defer s.mutex.RUnlock()
+// Get returns the mapped url as the code provided.
+// ErrNotFound is returned when the code is missing
+func (s *MemoryStore) Get(_ context.Context, code string) (string, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	url, ok := s.codeToLink[code]
 	if !ok {
 		return "", ErrNotFound

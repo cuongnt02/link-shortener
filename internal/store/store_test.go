@@ -11,7 +11,7 @@ import (
 // Use it for setup steps that the test is not about.
 func mustSave(t *testing.T, s *store.MemoryStore, code, url string) {
 	t.Helper()
-	if err := s.Save(code, url); err != nil {
+	if err := s.Save(t.Context(), code, url); err != nil {
 		t.Fatalf("setup: Save(%q, %q) returned error: %v", code, url, err)
 	}
 }
@@ -19,7 +19,7 @@ func mustSave(t *testing.T, s *store.MemoryStore, code, url string) {
 // assertGet checks that code maps to wantURL with no error.
 func assertGet(t *testing.T, s *store.MemoryStore, code, wantURL string) {
 	t.Helper()
-	got, err := s.Get(code)
+	got, err := s.Get(t.Context(), code)
 	if err != nil {
 		t.Errorf("Get(%q) returned error: %v, want nil", code, err)
 		return
@@ -32,7 +32,7 @@ func assertGet(t *testing.T, s *store.MemoryStore, code, wantURL string) {
 // assertNotFound checks that code is missing: empty url and ErrNotFound.
 func assertNotFound(t *testing.T, s *store.MemoryStore, code string) {
 	t.Helper()
-	got, err := s.Get(code)
+	got, err := s.Get(t.Context(), code)
 	if !errors.Is(err, store.ErrNotFound) {
 		t.Errorf("Get(%q) error = %v, want %v", code, err, store.ErrNotFound)
 	}
@@ -52,7 +52,7 @@ func TestGetOnEmptyStore(t *testing.T) {
 func TestSaveThenGet(t *testing.T) {
 	s := store.NewInMemoryStore()
 
-	if err := s.Save("hello", "https://example.com"); err != nil {
+	if err := s.Save(t.Context(), "hello", "https://example.com"); err != nil {
 		t.Fatalf("Save(%q, %q) returned error: %v, want nil", "hello", "https://example.com", err)
 	}
 
@@ -113,7 +113,7 @@ func TestSaveDuplicateCode(t *testing.T) {
 	s := store.NewInMemoryStore()
 	mustSave(t, s, "hello", "https://example.com")
 
-	err := s.Save("hello", "https://google.com")
+	err := s.Save(t.Context(), "hello", "https://google.com")
 	if !errors.Is(err, store.ErrCodeExists) {
 		t.Errorf("Save(%q, %q) on existing code: error = %v, want %v", "hello", "https://google.com", err, store.ErrCodeExists)
 	}

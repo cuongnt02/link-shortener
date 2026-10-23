@@ -1,25 +1,20 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
-	"net/url"
 
-	"github.com/cuongnt02/link-shortener/internal/shortener"
-	"github.com/cuongnt02/link-shortener/internal/store"
-)
-
-const (
-	codeLength  = 6
-	maxAttempts = 5
+	"github.com/cuongnt02/link-shortener/internal/link"
 )
 
 // Handler create a handler struct for request handling for the application
 type Handler struct {
-	store   *store.MemoryStore
-	baseURL string
+	linkService LinkService
+	baseURL     string
 }
 
 type shortenRequest struct {
@@ -31,11 +26,17 @@ type shortenResponse struct {
 	ShortURL string `json:"short_url"`
 }
 
+// LinkService define the dependent service methods that is used for handling link logic
+type LinkService interface {
+	Resolve(ctx context.Context, code string) (string, error)
+	Shorten(ctx context.Context, rawURL string) (string, error)
+}
+
 // New creates a new handler for the application and returns the pointer to it
-func New(s *store.MemoryStore, baseURL string) *Handler {
+func New(svc LinkService, baseURL string) *Handler {
 	return &Handler{
-		store:   s,
-		baseURL: baseURL,
+		linkService: svc,
+		baseURL:     baseURL,
 	}
 }
 
@@ -48,66 +49,25 @@ func (h *Handler) Health(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func validateURL(rawURL string) error {
-	parsedURL, err := url.Parse(rawURL)
-	if err != nil {
-		return err
-	}
-
-	scheme := parsedURL.Scheme
-	if scheme != "https" && scheme != "http" {
-		return errors.New("scheme is not supported or empty")
-	}
-
-	host := parsedURL.Host
-	if host == "" {
-		return errors.New("host is empty")
-	}
-
-	return nil
-}
-
 // Shorten accepts a url and returns a shorten version of it
 func (h *Handler) Shorten(w http.ResponseWriter, r *http.Request) {
 	var payload shortenRequest
 	err := json.NewDecoder(r.Body).Decode(&payload)
 	if err != nil {
-		http.Error(w, "malformed or invalid json request body", http.StatusBadRequest)
+		http.Error(w, fmt.Sprintf("malformed or invalid json request body: %s", r.Body), http.StatusBadRequest)
 		return
 	}
 
-	if err = validateURL(payload.URL); err != nil {
-		http.Error(w, "invalid url in request body: "+err.Error(), http.StatusBadRequest)
+	code, err := h.linkService.Shorten(r.Context(), payload.URL)
+	switch {
+	case errors.Is(err, link.ErrInvalidURL):
+		http.Error(w, fmt.Sprintf("invalid url used for shortening: %s", payload.URL), http.StatusBadRequest)
 		return
-	}
-	var code string
-	for range maxAttempts {
-		code, err = shortener.GenCode(codeLength)
-		if err != nil {
-			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
-			log.Printf("generate code failed for url %q, %v", payload.URL, err)
-			return
-		}
-
-		err = h.store.Save(code, payload.URL)
-		if err != nil {
-			if errors.Is(err, store.ErrCodeExists) {
-				continue
-			}
-			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
-			log.Printf("saving code for url %q got an unexpected error, %v", payload.URL, err)
-			return
-		}
-
-		break
-	}
-
-	if err != nil {
+	case err != nil:
 		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
-		log.Printf("max attempts of retries reached for generating code for url %q", payload.URL)
+		log.Printf("unexpected error occurred when shortening: %v", err)
 		return
 	}
-
 	w.Header().Set("Content-Type", "application/json")
 	response := shortenResponse{
 		Code:     code,
@@ -123,9 +83,9 @@ func (h *Handler) Shorten(w http.ResponseWriter, r *http.Request) {
 // Redirect routes the user to the expanded version of the url
 func (h *Handler) Redirect(w http.ResponseWriter, r *http.Request) {
 	code := r.PathValue("code")
-	link, err := h.store.Get(code)
+	linkResolved, err := h.linkService.Resolve(r.Context(), code)
 	switch {
-	case errors.Is(err, store.ErrNotFound):
+	case errors.Is(err, link.ErrNotFound):
 		http.Error(w, "short link not found", http.StatusNotFound)
 		return
 	case err != nil:
@@ -133,9 +93,10 @@ func (h *Handler) Redirect(w http.ResponseWriter, r *http.Request) {
 		log.Printf("unexpected error raised: error is %v", err)
 		return
 	}
-	http.Redirect(w, r, link, http.StatusFound)
+	http.Redirect(w, r, linkResolved, http.StatusFound)
 }
 
+// Routes define the application http routes
 func (h *Handler) Routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", h.Health)

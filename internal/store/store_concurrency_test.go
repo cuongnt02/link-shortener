@@ -34,7 +34,7 @@ func TestConcurrentSaves(t *testing.T) {
 		wg.Go(func() {
 			<-start // wait, so all goroutines begin at the same moment
 			code := fmt.Sprintf("code%d", i)
-			if err := s.Save(code, "https://example.com/"+code); err != nil {
+			if err := s.Save(t.Context(), code, "https://example.com/"+code); err != nil {
 				t.Errorf("Save(%q) returned error: %v", code, err)
 			}
 		})
@@ -61,14 +61,14 @@ func TestConcurrentSaveAndGet(t *testing.T) {
 		wg.Go(func() {
 			<-start
 			code := fmt.Sprintf("new%d", i)
-			if err := s.Save(code, "https://example.com/"+code); err != nil {
+			if err := s.Save(t.Context(), code, "https://example.com/"+code); err != nil {
 				t.Errorf("Save(%q) returned error: %v", code, err)
 			}
 		})
 		// reader: reads a code that exists the whole time
 		wg.Go(func() {
 			<-start
-			got, err := s.Get("existing")
+			got, err := s.Get(t.Context(), "existing")
 			if err != nil || got != "https://example.com/existing" {
 				t.Errorf("Get(%q) = %q, %v; want %q, nil", "existing", got, err, "https://example.com/existing")
 			}
@@ -95,7 +95,7 @@ func TestConcurrentDuplicateSave(t *testing.T) {
 		wg.Go(func() {
 			<-start
 			url := fmt.Sprintf("https://example.com/%d", i)
-			err := s.Save("same", url)
+			err := s.Save(t.Context(), "same", url)
 			switch {
 			case err == nil:
 				wins.Add(1)
