@@ -10,23 +10,25 @@ import (
 	"github.com/cuongnt02/link-shortener/internal/store"
 )
 
-// Concurrency tests: many goroutines use one store at the same time, the
-// way concurrent HTTP requests do in the real server.
+// Concurrency part of the store contract: many goroutines use one store at
+// the same time, the way concurrent HTTP requests do in the real server.
+// runStoreContract runs these for every store.
 //
 // Run them with the race detector:
 //
 //	go test -race -count=1 ./internal/store/
-//
-// Without -race, an unsafe map usually crashes the whole test run with
-// "fatal error: concurrent map writes". With -race, the detector reports
-// exactly which lines touched the map at the same time.
 
 const goroutines = 100
 
-// TestConcurrentSaves checks that saves from many goroutines at once are
+func runConcurrencyContract(t *testing.T, newStore storeFactory) {
+	t.Run("Saves", func(t *testing.T) { testConcurrentSaves(t, newStore(t)) })
+	t.Run("SaveAndGet", func(t *testing.T) { testConcurrentSaveAndGet(t, newStore(t)) })
+	t.Run("DuplicateSave", func(t *testing.T) { testConcurrentDuplicateSave(t, newStore(t)) })
+}
+
+// testConcurrentSaves checks that saves from many goroutines at once are
 // all kept.
-func TestConcurrentSaves(t *testing.T) {
-	s := store.NewInMemoryStore()
+func testConcurrentSaves(t *testing.T, s linkStore) {
 	start := make(chan struct{})
 	var wg sync.WaitGroup
 
@@ -48,10 +50,9 @@ func TestConcurrentSaves(t *testing.T) {
 	}
 }
 
-// TestConcurrentSaveAndGet checks that readers and writers can use the
+// testConcurrentSaveAndGet checks that readers and writers can use the
 // store at the same time.
-func TestConcurrentSaveAndGet(t *testing.T) {
-	s := store.NewInMemoryStore()
+func testConcurrentSaveAndGet(t *testing.T, s linkStore) {
 	mustSave(t, s, "existing", "https://example.com/existing")
 	start := make(chan struct{})
 	var wg sync.WaitGroup
@@ -78,14 +79,14 @@ func TestConcurrentSaveAndGet(t *testing.T) {
 	wg.Wait()
 }
 
-// TestConcurrentDuplicateSave has many goroutines race to save the same
+// testConcurrentDuplicateSave has many goroutines race to save the same
 // code. Exactly one may win; every other one must get ErrCodeExists.
 //
 // This catches a subtle bug: if "is the code taken?" and "save it" are
-// two separate locked steps, two goroutines can both see "not taken" and
-// both save. Being race-detector clean is not enough to pass this test.
-func TestConcurrentDuplicateSave(t *testing.T) {
-	s := store.NewInMemoryStore()
+// two separate steps, two goroutines can both see "not taken" and both
+// save. For a database, that means checking with a SELECT and then doing
+// an INSERT is not safe: the database itself must reject the duplicate.
+func testConcurrentDuplicateSave(t *testing.T, s linkStore) {
 	start := make(chan struct{})
 	var wg sync.WaitGroup
 	var wins atomic.Int64

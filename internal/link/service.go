@@ -21,6 +21,7 @@ var (
 // MaxAttempts defines number of attempts should be made generating code before throwing error
 const MaxAttempts = 5
 
+// Generator is a convenient type to defined how the code generator should behave
 type Generator func() (string, error)
 
 // Store defines a service layer storing functionality for the internal store

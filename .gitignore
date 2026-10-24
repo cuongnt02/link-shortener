@@ -4,3 +4,5 @@ bin/
 *.db
 .vscode/
 .idea/
+sqlite.db-shm
+sqlite.db-wal

@@ -15,10 +15,13 @@ import (
 // these tests replace both with fakes they fully control. No real store,
 // no randomness, no HTTP.
 
-// The real memory store must satisfy link.Store. This line does not run
-// anything: if MemoryStore's methods stop matching the interface, the test
+// Both real stores must satisfy link.Store. These lines don't run
+// anything: if a store's methods stop matching the interface, the test
 // package fails to compile.
-var _ link.Store = (*store.MemoryStore)(nil)
+var (
+	_ link.Store = (*store.MemoryStore)(nil)
+	_ link.Store = (*store.SQLiteStore)(nil)
+)
 
 // errBoom stands in for an unexpected failure, like a database going down.
 var errBoom = errors.New("boom: database unreachable")
