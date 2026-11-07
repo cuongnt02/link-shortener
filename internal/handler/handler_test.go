@@ -1,10 +1,12 @@
 package handler_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -31,6 +33,9 @@ type shortenResponse struct {
 	Code     string `json:"code"`
 	ShortURL string `json:"short_url"`
 }
+
+// discardLogger throws every log line away, for tests that don't check logs.
+var discardLogger = slog.New(slog.DiscardHandler)
 
 // errInternal stands in for an unexpected failure. Its message contains
 // details that must never be shown to clients.
@@ -92,7 +97,7 @@ func assertNoLeak(t *testing.T, rec *httptest.ResponseRecorder) {
 }
 
 func TestHealth(t *testing.T) {
-	h := handler.New(&fakeService{}, testBaseURL)
+	h := handler.New(&fakeService{}, testBaseURL, discardLogger)
 	req := httptest.NewRequest(http.MethodGet, "/health", nil)
 	rec := httptest.NewRecorder()
 
@@ -110,7 +115,7 @@ func TestHealth(t *testing.T) {
 // builds the 201 JSON response from the code the service returns.
 func TestShortenSuccess(t *testing.T) {
 	svc := &fakeService{shortenCode: "abc123"}
-	h := handler.New(svc, testBaseURL)
+	h := handler.New(svc, testBaseURL, discardLogger)
 
 	rec := callShorten(t, h, `{"url":"https://go.dev"}`)
 
@@ -150,7 +155,7 @@ func TestShortenBadJSON(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			svc := &fakeService{shortenCode: "abc123"}
-			h := handler.New(svc, testBaseURL)
+			h := handler.New(svc, testBaseURL, discardLogger)
 
 			rec := callShorten(t, h, tt.body)
 
@@ -180,7 +185,7 @@ func TestShortenServiceErrors(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			h := handler.New(&fakeService{shortenErr: tt.err}, testBaseURL)
+			h := handler.New(&fakeService{shortenErr: tt.err}, testBaseURL, discardLogger)
 
 			rec := callShorten(t, h, `{"url":"https://go.dev"}`)
 
@@ -194,7 +199,7 @@ func TestShortenServiceErrors(t *testing.T) {
 
 func TestRedirectKnownCode(t *testing.T) {
 	svc := &fakeService{resolveURL: "https://go.dev/doc"}
-	h := handler.New(svc, testBaseURL)
+	h := handler.New(svc, testBaseURL, discardLogger)
 
 	rec := callRedirect(t, h, "abc123")
 
@@ -224,7 +229,7 @@ func TestRedirectServiceErrors(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			h := handler.New(&fakeService{resolveErr: tt.err}, testBaseURL)
+			h := handler.New(&fakeService{resolveErr: tt.err}, testBaseURL, discardLogger)
 
 			rec := callRedirect(t, h, "nope42")
 
@@ -235,6 +240,100 @@ func TestRedirectServiceErrors(t *testing.T) {
 				t.Errorf("Location = %q, want no Location header", loc)
 			}
 			assertNoLeak(t, rec)
+		})
+	}
+}
+
+// logEntry is the part of a JSON log line the tests look at.
+type logEntry struct {
+	Level string `json:"level"`
+	Msg   string `json:"msg"`
+	Error string `json:"error"`
+}
+
+// newCaptureLogger returns a logger that writes JSON lines into a buffer.
+func newCaptureLogger() (*slog.Logger, *bytes.Buffer) {
+	var buf bytes.Buffer
+	return slog.New(slog.NewJSONHandler(&buf, nil)), &buf
+}
+
+// parseLog decodes every JSON line written to buf.
+func parseLog(t *testing.T, buf *bytes.Buffer) []logEntry {
+	t.Helper()
+	var entries []logEntry
+	dec := json.NewDecoder(buf)
+	for dec.More() {
+		var e logEntry
+		if err := dec.Decode(&e); err != nil {
+			t.Fatalf("log output is not JSON lines: %v", err)
+		}
+		entries = append(entries, e)
+	}
+	return entries
+}
+
+// TestServerErrorsAreLogged is the other half of assertNoLeak: internal
+// error details must never reach the client, but they must reach the
+// logs, at ERROR level, in an "error" attribute, or nobody can debug the
+// 500. Expected client mistakes (bad JSON, unknown code) are not errors
+// and must not be logged at ERROR level.
+func TestServerErrorsAreLogged(t *testing.T) {
+	tests := []struct {
+		name    string
+		svc     *fakeService
+		call    func(*testing.T, *handler.Handler) *httptest.ResponseRecorder
+		wantErr bool
+	}{
+		{
+			name: "shorten fails",
+			svc:  &fakeService{shortenErr: errInternal},
+			call: func(t *testing.T, h *handler.Handler) *httptest.ResponseRecorder {
+				return callShorten(t, h, `{"url":"https://go.dev"}`)
+			},
+			wantErr: true,
+		},
+		{
+			name:    "redirect fails",
+			svc:     &fakeService{resolveErr: errInternal},
+			call:    func(t *testing.T, h *handler.Handler) *httptest.ResponseRecorder { return callRedirect(t, h, "abc123") },
+			wantErr: true,
+		},
+		{
+			name: "bad json is not a server error",
+			svc:  &fakeService{},
+			call: func(t *testing.T, h *handler.Handler) *httptest.ResponseRecorder { return callShorten(t, h, `nope`) },
+		},
+		{
+			name: "unknown code is not a server error",
+			svc:  &fakeService{resolveErr: link.ErrNotFound},
+			call: func(t *testing.T, h *handler.Handler) *httptest.ResponseRecorder { return callRedirect(t, h, "nope42") },
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			logger, buf := newCaptureLogger()
+			h := handler.New(tt.svc, testBaseURL, logger)
+
+			tt.call(t, h)
+
+			var errorLines []logEntry
+			for _, e := range parseLog(t, buf) {
+				if e.Level == "ERROR" {
+					errorLines = append(errorLines, e)
+				}
+			}
+			if !tt.wantErr {
+				if len(errorLines) != 0 {
+					t.Errorf("got ERROR log lines %+v, want none for a client mistake", errorLines)
+				}
+				return
+			}
+			if len(errorLines) != 1 {
+				t.Fatalf("got %d ERROR log lines, want exactly 1", len(errorLines))
+			}
+			if !strings.Contains(errorLines[0].Error, "hunter2") {
+				t.Errorf(`ERROR line has "error" = %q, want it to contain the real error`, errorLines[0].Error)
+			}
 		})
 	}
 }

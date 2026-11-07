@@ -5,7 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
+	"io"
+	"log/slog"
 	"net/http"
 
 	"github.com/cuongnt02/link-shortener/internal/link"
@@ -15,6 +16,7 @@ import (
 type Handler struct {
 	linkService LinkService
 	baseURL     string
+	logger      *slog.Logger
 }
 
 type shortenRequest struct {
@@ -33,10 +35,11 @@ type LinkService interface {
 }
 
 // New creates a new handler for the application and returns the pointer to it
-func New(svc LinkService, baseURL string) *Handler {
+func New(svc LinkService, baseURL string, logger *slog.Logger) *Handler {
 	return &Handler{
 		linkService: svc,
 		baseURL:     baseURL,
+		logger:      logger,
 	}
 }
 
@@ -45,7 +48,7 @@ func (h *Handler) Health(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	_, err := w.Write([]byte("ok"))
 	if err != nil {
-		log.Printf("error at handler: %v", err)
+		h.logger.WarnContext(r.Context(), "error at handler", slog.Any("error", err))
 	}
 }
 
@@ -54,18 +57,18 @@ func (h *Handler) Shorten(w http.ResponseWriter, r *http.Request) {
 	var payload shortenRequest
 	err := json.NewDecoder(r.Body).Decode(&payload)
 	if err != nil {
-		http.Error(w, fmt.Sprintf("malformed or invalid json request body: %s", r.Body), http.StatusBadRequest)
+		http.Error(w, makeRequestErrorMessage(err), http.StatusBadRequest)
 		return
 	}
 
 	code, err := h.linkService.Shorten(r.Context(), payload.URL)
 	switch {
 	case errors.Is(err, link.ErrInvalidURL):
-		http.Error(w, fmt.Sprintf("invalid url used for shortening: %s", payload.URL), http.StatusBadRequest)
+		http.Error(w, fmt.Sprintf("invalid url used for shortening: %v", err), http.StatusBadRequest)
 		return
 	case err != nil:
 		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
-		log.Printf("unexpected error occurred when shortening: %v", err)
+		h.logger.ErrorContext(r.Context(), "unexpected error occurred when shortening", slog.Any("error", err))
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -76,7 +79,7 @@ func (h *Handler) Shorten(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusCreated)
 	err = json.NewEncoder(w).Encode(response)
 	if err != nil {
-		log.Printf("error encoding response, encode failed for response %v, error: %v", response, err)
+		h.logger.WarnContext(r.Context(), "error encoding response", slog.Any("error", err))
 	}
 }
 
@@ -90,10 +93,27 @@ func (h *Handler) Redirect(w http.ResponseWriter, r *http.Request) {
 		return
 	case err != nil:
 		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
-		log.Printf("unexpected error raised: error is %v", err)
+		h.logger.ErrorContext(r.Context(), "failed to resolve link", slog.Any("error", err), slog.String("code", code))
 		return
 	}
 	http.Redirect(w, r, linkResolved, http.StatusFound)
+}
+
+func makeRequestErrorMessage(err error) string {
+	var typeErr *json.UnmarshalTypeError
+	var syntaxErr *json.SyntaxError
+	switch {
+	case errors.Is(err, io.EOF):
+		return "request body is empty"
+	case errors.Is(err, io.ErrUnexpectedEOF):
+		return "request body is incomplete JSON"
+	case errors.As(err, &typeErr):
+		return fmt.Sprintf("field %q must be a %s, got %s", typeErr.Field, typeErr.Type, typeErr.Value)
+	case errors.As(err, &syntaxErr):
+		return fmt.Sprintf("request body at byte %d is not valid JSON", syntaxErr.Offset)
+	default:
+		return "invalid request body"
+	}
 }
 
 // Routes define the application http routes

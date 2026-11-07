@@ -31,6 +31,7 @@ func NewSQLiteStore(ctx context.Context, path string) (_ *SQLiteStore, err error
 			}
 		}
 	}()
+	db.SetMaxOpenConns(1)
 	err = db.PingContext(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("connecting to database %q: %w", path, err)

@@ -37,7 +37,7 @@ func newTestServer(t *testing.T) *httptest.Server {
 
 	generate := func() (string, error) { return shortener.GenCode(6) }
 	svc := link.NewService(store.NewInMemoryStore(), generate)
-	h := handler.New(svc, srv.URL)
+	h := handler.New(svc, srv.URL, discardLogger)
 	mux.Handle("/", h.Routes())
 	return srv
 }
